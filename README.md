@@ -1,24 +1,15 @@
 # export-projects
 
-Dumps Rancher projects and memberships from the management cluster into GitOps-ready YAML. Output is grouped as `<cluster-friendly-name>_<cluster-id>/`, with runtime fields stripped so existing objects can be adopted alongside new GitOps-managed projects.
+Dumps Rancher projects and memberships into GitOps-ready YAML using the Rancher API (no kubectl or kubeconfig). Output is grouped as `<cluster-friendly-name>_<cluster-id>/`, with runtime fields stripped so existing objects can be adopted alongside new GitOps-managed projects.
 
-## Prequisites
-
-These scripts require the following CLI tools and resources:
-
-  * `jq`
-  * `yq`
-  * `curl`
-  * `kubectl`
-  * Rancher Management cluster (`local`) Kubeconfig file.
-  * Rancher API Token (`RANCHER_TOKEN`). (Optional: Only used for `test.sh`, to validate the scripts)
+Requires `curl`, `jq`, `yq`, and a Rancher API token.
 
 ## Flags
 
 | Flag | Scripts | Description |
 | --- | --- | --- |
-| `--kubeconfig PATH` | both | Kubeconfig for the Rancher local cluster (default: `local.yaml`, or `KUBECONFIG`) |
 | `--rancher-url URL` | both | Rancher URL (default: `https://rancher-manager.somequant.club`, or `RANCHER_URL`) |
+| `--rancher-token TOK` | both | API token (or `RANCHER_TOKEN`) |
 | `--out DIR` | both | Output directory (`export.sh`: `export-projects/out`; `test.sh`: `out-test-<timestamp>`) |
 | `--cluster ID` | `export.sh` | Limit export to one management cluster ID (repeatable) |
 | `-h`, `--help` | both | Show usage |
@@ -28,18 +19,18 @@ These scripts require the following CLI tools and resources:
 ```bash
 # All clusters
 ./export-projects/export.sh \
-  --kubeconfig ./local.yaml \
-  --rancher-url $RANCHER_URL
+  --rancher-url "$RANCHER_URL" \
+  --rancher-token "$RANCHER_TOKEN"
 
 # Single cluster
 ./export-projects/export.sh \
-  --kubeconfig ./local.yaml \
-  --rancher-url $RANCHER_URL \
+  --rancher-url "$RANCHER_URL" \
+  --rancher-token "$RANCHER_TOKEN" \
   --cluster c-m-88mf69g6 \
   --out ./exported
 
-# Tests scripts: apply of Cluster/Project/Members and export
-RANCHER_TOKEN=... ./export-projects/test.sh \
-  --kubeconfig ./local.yaml \
-  --rancher-url $RANCHER_URL
+# Create fixture clusters/projects, export, then delete fixtures
+./export-projects/test.sh \
+  --rancher-url "$RANCHER_URL" \
+  --rancher-token "$RANCHER_TOKEN"
 ```

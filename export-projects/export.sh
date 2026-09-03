@@ -8,9 +8,7 @@
 #     memberships/<project-id>/<prtb-name>.yaml
 #
 # Usage:
-#   ./export.sh --kubeconfig PATH --rancher-url URL [--out DIR] [--cluster CLUSTER_ID]...
-#
-# Flags override KUBECONFIG / RANCHER_URL when those env vars are also set.
+#   ./export.sh --rancher-url URL --rancher-token TOKEN [--out DIR] [--cluster CLUSTER_ID]...
 
 set -euo pipefail
 
@@ -22,16 +20,15 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
-Export all Rancher projects (and memberships) from the management cluster.
+Export all Rancher projects (and memberships) via the Rancher API.
 Cluster folders are named <friendly-name>_<cluster-id>.
 
 Options:
-  --kubeconfig PATH  Kubeconfig for the Rancher local/management cluster
-                     (default: ${REPO_ROOT}/local.yaml, or KUBECONFIG)
-  --rancher-url URL  Rancher URL (default: ${RANCHER_URL}, or RANCHER_URL)
-  --out DIR          Output directory (default: ${SCRIPT_DIR}/out)
-  --cluster ID       Limit export to one management cluster ID (repeatable)
-  -h, --help         Show this help
+  --rancher-url URL    Rancher URL (default: ${RANCHER_URL}, or RANCHER_URL)
+  --rancher-token TOK  API token (or RANCHER_TOKEN)
+  --out DIR            Output directory (default: ${SCRIPT_DIR}/out)
+  --cluster ID         Limit export to one management cluster ID (repeatable)
+  -h, --help           Show this help
 EOF
 }
 
@@ -66,7 +63,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-require_cmd kubectl yq jq
+require_cmd curl yq jq
 resolve_connection
 
 mkdir -p "${OUT_DIR}"
@@ -86,12 +83,15 @@ should_export_cluster() {
   return 1
 }
 
-echo "kubeconfig:  ${KUBECONFIG}"
 echo "rancher-url: ${RANCHER_URL}"
 echo "output:      ${OUT_DIR}"
 
-cluster_ids="$(kctl get clusters.management.cattle.io -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
-if [[ -z "${cluster_ids}" ]]; then
+clusters_json="$(steve_list /v1/management.cattle.io.clusters)"
+projects_json="$(steve_list /v1/management.cattle.io.projects)"
+prtbs_json="$(steve_list /v1/management.cattle.io.projectroletemplatebindings)"
+
+cluster_count="$(jq '.items | length' <<<"${clusters_json}")"
+if [[ "${cluster_count}" -eq 0 ]]; then
   echo "error: no management clusters found" >&2
   exit 1
 fi
@@ -100,28 +100,28 @@ exported_projects=0
 exported_memberships=0
 exported_clusters=0
 
-while IFS= read -r cluster_id; do
-  [[ -z "${cluster_id}" ]] && continue
+while IFS= read -r cluster; do
+  [[ -z "${cluster}" ]] && continue
+  cluster_id="$(jq -r '.metadata.name' <<<"${cluster}")"
   should_export_cluster "${cluster_id}" || continue
 
-  display_name="$(cluster_display_name "${cluster_id}")"
+  display_name="$(jq -r '.spec.displayName // .metadata.name' <<<"${cluster}")"
+  provider="$(jq -r '.status.provider // "unknown"' <<<"${cluster}")"
   folder="$(cluster_folder_name "${display_name}" "${cluster_id}")"
   cluster_dir="${OUT_DIR}/${folder}"
   mkdir -p "${cluster_dir}/projects"
 
-  provider="$(kctl get clusters.management.cattle.io "${cluster_id}" -o jsonpath='{.status.provider}' 2>/dev/null || true)"
   cat > "${cluster_dir}/cluster.yaml" <<EOF
 clusterId: ${cluster_id}
 displayName: ${display_name}
-provider: ${provider:-unknown}
+provider: ${provider}
 EOF
 
   echo "cluster ${display_name} (${cluster_id}) -> ${folder}"
   exported_clusters=$((exported_clusters + 1))
 
-  projects_json="$(kctl get projects.management.cattle.io -n "${cluster_id}" -o json 2>/dev/null || echo '{"items":[]}')"
-  project_count="$(jq '.items | length' <<<"${projects_json}")"
-
+  cluster_projects="$(jq --arg ns "${cluster_id}" '{items: [.items[] | select(.metadata.namespace == $ns)]}' <<<"${projects_json}")"
+  project_count="$(jq '.items | length' <<<"${cluster_projects}")"
   if [[ "${project_count}" -eq 0 ]]; then
     echo "  (no projects)"
     continue
@@ -140,11 +140,7 @@ EOF
     if [[ -z "${backing_ns}" ]]; then
       continue
     fi
-    if ! kctl get ns "${backing_ns}" >/dev/null 2>&1; then
-      continue
-    fi
 
-    prtb_json="$(kctl get projectroletemplatebindings.management.cattle.io -n "${backing_ns}" -o json 2>/dev/null || echo '{"items":[]}')"
     while IFS= read -r prtb; do
       [[ -z "${prtb}" ]] && continue
       prtb_name="$(jq -r '.metadata.name' <<<"${prtb}")"
@@ -152,9 +148,9 @@ EOF
       jq -r '.' <<<"${prtb}" | yq eval -P '.' | write_sanitized "${prtb_file}"
       echo "    membership ${prtb_name}"
       exported_memberships=$((exported_memberships + 1))
-    done < <(jq -c '(.items // [])[]' <<<"${prtb_json}")
-  done < <(jq -c '(.items // [])[]' <<<"${projects_json}")
-done <<<"${cluster_ids}"
+    done < <(jq -c --arg ns "${backing_ns}" '.items[] | select(.metadata.namespace == $ns)' <<<"${prtbs_json}")
+  done < <(jq -c '.items[]' <<<"${cluster_projects}")
+done < <(jq -c '.items[]' <<<"${clusters_json}")
 
 echo
 echo "exported ${exported_clusters} cluster(s), ${exported_projects} project(s), ${exported_memberships} membership(s)"
