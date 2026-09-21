@@ -9,6 +9,17 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${RANCHER_URL:=https://rancher-manager.somequant.club}"
 : "${OUT_DIR:=${SCRIPT_DIR}/out}"
 
+load_repo_env() {
+  local env_file="${REPO_ROOT}/.env"
+  [[ -f "${env_file}" ]] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+}
+
+load_repo_env
+
 # Pull connection flags off the argument list. Remaining flags are left in
 # CONNECTION_REST for the caller to parse.
 parse_connection_flags() {
@@ -100,8 +111,8 @@ rancher_api() {
   rancher_request "$@"
 }
 
-# List a Steve collection, following pagination.next. Prints {items:[...]}.
-steve_list() {
+# List a Steve or Norman collection, following pagination.next. Prints {items:[...]}.
+rancher_list() {
   local path="$1"
   local tmp page next
   tmp="$(mktemp)"
@@ -115,6 +126,117 @@ steve_list() {
   done
   jq '{items: .}' "${tmp}"
   rm -f "${tmp}"
+}
+
+steve_list() {
+  rancher_list "$@"
+}
+
+# Kubernetes List from the Rancher cluster proxy ({items:[...]}).
+k8s_list() {
+  local path="$1"
+  local page
+  if ! page="$(rancher_request GET "${path}" 2>/dev/null)"; then
+    echo '{"items":[]}'
+    return 0
+  fi
+  jq '{items: (.items // [])}' <<<"${page}"
+}
+
+k8s_get() {
+  local path="$1"
+  rancher_request GET "${path}"
+}
+
+# List items often omit apiVersion/kind; restore them for GitOps apply.
+ensure_gvk() {
+  local api_version="$1"
+  local kind="$2"
+  jq --arg api "${api_version}" --arg kind "${kind}" '
+    .apiVersion = (.apiVersion // $api) | .kind = (.kind // $kind)
+  '
+}
+
+# Norman namespace -> core/v1 Namespace JSON.
+norman_namespace_to_k8s() {
+  jq '{
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: (
+      {
+        name: .name
+      }
+      + {
+          annotations: (
+            (.annotations // {})
+            + if ((.projectId // "") != "") then {"field.cattle.io/projectId": .projectId} else {} end
+          )
+        }
+      + {
+          labels: (
+            (.labels // {})
+            + if ((.projectId // "") != "") then {"field.cattle.io/projectId": (.projectId | split(":")[1])} else {} end
+          )
+        }
+    )
+  }'
+}
+
+# Run an API call as a different token without clobbering RANCHER_TOKEN.
+with_token() {
+  local token="$1"
+  shift
+  local saved="${RANCHER_TOKEN}" rc=0
+  RANCHER_TOKEN="${token}"
+  "$@" || rc=$?
+  RANCHER_TOKEN="${saved}"
+  return "${rc}"
+}
+
+# Norman project -> management.cattle.io/v3 Project JSON.
+norman_project_to_k8s() {
+  jq '{
+    apiVersion: "management.cattle.io/v3",
+    kind: "Project",
+    metadata: (
+      {
+        name: (.id | split(":")[1]),
+        namespace: .clusterId
+      }
+      + (if (.annotations // {}) != {} then {annotations: .annotations} else {} end)
+      + (if (.labels // {}) != {} then {labels: .labels} else {} end)
+    ),
+    spec: (
+      {
+        clusterName: .clusterId,
+        displayName: .name
+      }
+      + if ((.description // "") != "") then {description: .description} else {} end
+    )
+  }'
+}
+
+# Norman projectRoleTemplateBinding -> management.cattle.io/v3 PRTB JSON.
+# $backing_ns is the project's backing namespace (PRTB metadata.namespace).
+norman_prtb_to_k8s() {
+  local backing_ns="$1"
+  jq --arg ns "${backing_ns}" '{
+    apiVersion: "management.cattle.io/v3",
+    kind: "ProjectRoleTemplateBinding",
+    metadata: (
+      {
+        name: (.name // (.id | split(":")[-1])),
+        namespace: $ns
+      }
+      + (if (.labels // {}) != {} then {labels: .labels} else {} end)
+    ),
+    projectName: .projectId,
+    roleTemplateName: .roleTemplateId
+  }
+  + (if (.userId // "") != "" then {userName: .userId} else {} end)
+  + (if (.userPrincipalId // "") != "" then {userPrincipalName: .userPrincipalId} else {} end)
+  + (if (.groupId // "") != "" then {groupName: .groupId} else {} end)
+  + (if (.groupPrincipalId // "") != "" then {groupPrincipalName: .groupPrincipalId} else {} end)'
 }
 
 # Filesystem-safe token for directory and file names.
@@ -162,7 +284,8 @@ sanitize_yaml() {
       .metadata.relationships,
       .metadata.state
     )
-    | .metadata.annotations |= ((. // {}) | with_entries(select(.key | test("^(lifecycle\\.cattle\\.io/|objectset\\.rio\\.cattle\\.io/|kubectl\\.kubernetes\\.io/last-applied-configuration|authz\\.management\\.cattle\\.io/creator-role-bindings)") | not)))
+    | del(.spec.finalizers)
+    | .metadata.annotations |= ((. // {}) | with_entries(select(.key | test("^(lifecycle\\.cattle\\.io/|objectset\\.rio\\.cattle\\.io/|cattle\\.io/status|kubectl\\.kubernetes\\.io/last-applied-configuration|authz\\.management\\.cattle\\.io/creator-role-bindings)") | not)))
     | .metadata.labels |= ((. // {}) | with_entries(select(.key | test("crb-rb-labels-updated") | not)))
     | with(select(.metadata.annotations != null and ((.metadata.annotations | length) == 0)); del(.metadata.annotations))
     | with(select(.metadata.labels != null and ((.metadata.labels | length) == 0)); del(.metadata.labels))

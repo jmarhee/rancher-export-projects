@@ -1,6 +1,6 @@
 # export-projects
 
-Dumps Rancher projects and memberships into GitOps-ready YAML using the Rancher API (no kubectl or kubeconfig). Output is grouped as `<cluster-friendly-name>_<cluster-id>/`, with runtime fields stripped so existing objects can be adopted alongside new GitOps-managed projects.
+Dumps Rancher projects and memberships the API token can access into GitOps-ready YAML. Uses the Rancher user API (`/v3`), not the management-cluster Kubernetes API, so a project member token is enough. The token only sees application clusters it is a member of, not via `local`. Output is grouped as `<cluster-friendly-name>_<cluster-id>/`.
 
 Requires `curl`, `jq`, `yq`, and a Rancher API token.
 
@@ -8,28 +8,25 @@ Requires `curl`, `jq`, `yq`, and a Rancher API token.
 
 | Flag | Scripts | Description |
 | --- | --- | --- |
-| `--rancher-url URL` | both | Rancher URL (default: `https://rancher-manager.somequant.club`, or `RANCHER_URL`) |
-| `--rancher-token TOK` | both | API token (or `RANCHER_TOKEN`) |
-| `--out DIR` | both | Output directory (`export.sh`: `export-projects/out`; `test.sh`: `out-test-<timestamp>`) |
-| `--cluster ID` | `export.sh` | Limit export to one management cluster ID (repeatable) |
+| `--rancher-url URL` | both | Rancher URL (or `RANCHER_URL`) |
+| `--rancher-token TOK` | both | API token used to export (`export.sh`) or admin token for fixtures (`test.sh`) |
+| `--no-local-rancher-token TOK` | `test.sh` | Token for the no-local-rancher user (or `NO_LOCAL_RANCHER_TOKEN` in `.env`) |
+| `--no-local-rancher-user-id ID` | `test.sh` | User to grant fixture access (default: `m-n9rl5`) |
+| `--out DIR` | both | Output directory |
+| `--cluster ID` | `export.sh` | Limit export to one cluster ID (repeatable) |
+| `--include-namespaces` | `export.sh` | Also export project namespaces and their Roles/RoleBindings |
 | `-h`, `--help` | both | Show usage |
 
 ## Examples
 
 ```bash
-# All clusters
+# Export clusters/projects this token can see
 ./export-projects/export.sh \
   --rancher-url "$RANCHER_URL" \
-  --rancher-token "$RANCHER_TOKEN"
+  --rancher-token "$NO_LOCAL_RANCHER_TOKEN" \
+  --include-namespaces
 
-# Single cluster
-./export-projects/export.sh \
-  --rancher-url "$RANCHER_URL" \
-  --rancher-token "$RANCHER_TOKEN" \
-  --cluster c-m-88mf69g6 \
-  --out ./exported
-
-# Create fixture clusters/projects, export, then delete fixtures
+# Admin creates blank custom clusters, grants the no-local-rancher user, exports as that user, then cleans up
 ./export-projects/test.sh \
   --rancher-url "$RANCHER_URL" \
   --rancher-token "$RANCHER_TOKEN"
