@@ -4,3 +4,5 @@ local.yaml
 export-projects/out*/
 export-projects/out-test-*/
 export-projects/test-run.log
+.DS_Store 
+*.diff
