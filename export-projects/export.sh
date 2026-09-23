@@ -101,13 +101,16 @@ echo "rancher-url: ${RANCHER_URL}"
 echo "output:      ${OUT_DIR}"
 
 # User-scoped Norman APIs: filtered to what this token can see, no local-cluster list RBAC.
-clusters_json="$(rancher_list /v3/clusters)"
-projects_json="$(rancher_list /v3/projects)"
+# Write collections to files so jq never hits ARG_MAX (--argjson puts JSON on argv).
+clusters_file="$(mktemp)"
+projects_file="$(mktemp)"
+trap 'rm -f "${clusters_file}" "${projects_file}"' EXIT
+rancher_list /v3/clusters >"${clusters_file}"
+rancher_list /v3/projects >"${projects_file}"
 
-cluster_ids="$(jq -r -n \
-  --argjson clusters "${clusters_json}" \
-  --argjson projects "${projects_json}" \
-  '([($clusters.items // [])[].id] + [($projects.items // [])[].clusterId] | unique | .[])')"
+cluster_ids="$(jq -r -s '
+  ([.[0].items // [] | .[].id] + [.[1].items // [] | .[].clusterId] | unique | .[])
+' "${clusters_file}" "${projects_file}")"
 
 if [[ -z "${cluster_ids}" ]]; then
   echo "error: no clusters or projects visible to this token" >&2
@@ -188,7 +191,7 @@ while IFS= read -r cluster_id; do
   [[ -z "${cluster_id}" ]] && continue
   should_export_cluster "${cluster_id}" || continue
 
-  cluster="$(jq -c --arg id "${cluster_id}" '.items[] | select(.id == $id)' <<<"${clusters_json}")"
+  cluster="$(jq -c --arg id "${cluster_id}" '.items[] | select(.id == $id)' "${clusters_file}")"
   if [[ -z "${cluster}" ]]; then
     cluster="$(rancher_request GET "/v3/clusters/${cluster_id}" 2>/dev/null || echo '{}')"
   fi
@@ -215,7 +218,7 @@ EOF
   # downstream projects depending on token scope.
   cluster_projects="$(rancher_list "/v3/projects?clusterId=${cluster_id}")"
   if [[ "$(jq '.items | length' <<<"${cluster_projects}")" -eq 0 ]]; then
-    cluster_projects="$(jq -c --arg id "${cluster_id}" '{items: [.items[] | select(.clusterId == $id)]}' <<<"${projects_json}")"
+    cluster_projects="$(jq -c --arg id "${cluster_id}" '{items: [.items[] | select(.clusterId == $id)]}' "${projects_file}")"
   fi
 
   project_count="$(jq '.items | length' <<<"${cluster_projects}")"
