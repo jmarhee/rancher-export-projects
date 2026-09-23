@@ -15,7 +15,7 @@
 #     namespaces/<ns>/roles/<name>.yaml
 #
 # Usage:
-#   ./export.sh --rancher-url URL --rancher-token TOKEN [--include-namespaces] [--out DIR] [--cluster CLUSTER_ID]...
+#   ./export.sh --rancher-url URL --rancher-token TOKEN [--include-namespaces] [--out DIR] [--cluster ID|NAME]... [--cluster-file FILE] [--jobs N]
 
 set -euo pipefail
 
@@ -35,7 +35,11 @@ Options:
   --rancher-url URL    Rancher URL (default: ${RANCHER_URL}, or RANCHER_URL)
   --rancher-token TOK  API token (or RANCHER_TOKEN)
   --out DIR              Output directory (default: ${SCRIPT_DIR}/out)
-  --cluster ID           Limit export to one cluster ID (repeatable)
+  --cluster ID|NAME      Limit export to one cluster ID or friendly name (repeatable)
+  --cluster-name NAME    Same as --cluster (repeatable)
+  --cluster-file FILE    Cluster IDs or names, one per line (repeatable; # comments ok)
+  --jobs N               Export up to N clusters at once (default: 1)
+  --parallel N           Same as --jobs
   --include-namespaces   Also export project namespaces and their Roles/RoleBindings
   -h, --help             Show this help
 EOF
@@ -49,7 +53,9 @@ else
 fi
 
 FILTER_CLUSTERS=()
+CLUSTER_FILES=()
 INCLUDE_NAMESPACES=0
+JOBS="${JOBS:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,9 +63,41 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
-    --cluster)
+    --cluster|--cluster-name)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a cluster ID or friendly name" >&2
+        exit 1
+      fi
       FILTER_CLUSTERS+=("$2")
       shift 2
+      ;;
+    --cluster=*|--cluster-name=*)
+      FILTER_CLUSTERS+=("${1#*=}")
+      shift
+      ;;
+    --cluster-file)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a file path" >&2
+        exit 1
+      fi
+      CLUSTER_FILES+=("$2")
+      shift 2
+      ;;
+    --cluster-file=*)
+      CLUSTER_FILES+=("${1#*=}")
+      shift
+      ;;
+    --jobs|--parallel)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a positive integer" >&2
+        exit 1
+      fi
+      JOBS="$2"
+      shift 2
+      ;;
+    --jobs=*|--parallel=*)
+      JOBS="${1#*=}"
+      shift
       ;;
     --include-namespaces)
       INCLUDE_NAMESPACES=1
@@ -77,6 +115,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+load_cluster_file() {
+  local file="$1" line
+  if [[ ! -f "${file}" ]]; then
+    echo "error: cluster file not found: ${file}" >&2
+    exit 1
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    FILTER_CLUSTERS+=("${line}")
+  done <"${file}"
+}
+
+for cluster_file in ${CLUSTER_FILES[@]+"${CLUSTER_FILES[@]}"}; do
+  load_cluster_file "${cluster_file}"
+done
+
+if ! [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: --jobs must be a positive integer (got ${JOBS})" >&2
+  exit 1
+fi
+
 require_cmd curl yq jq
 resolve_connection
 
@@ -85,12 +146,13 @@ OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 
 should_export_cluster() {
   local cluster_id="$1"
+  local cluster_name="$2"
   if [[ ${#FILTER_CLUSTERS[@]} -eq 0 ]]; then
     return 0
   fi
   local wanted
   for wanted in "${FILTER_CLUSTERS[@]}"; do
-    if [[ "${wanted}" == "${cluster_id}" ]]; then
+    if [[ "${wanted}" == "${cluster_id}" || "${wanted}" == "${cluster_name}" ]]; then
       return 0
     fi
   done
@@ -99,12 +161,23 @@ should_export_cluster() {
 
 echo "rancher-url: ${RANCHER_URL}"
 echo "output:      ${OUT_DIR}"
+if [[ "${JOBS}" -gt 1 ]]; then
+  echo "jobs:        ${JOBS}"
+fi
 
 # User-scoped Norman APIs: filtered to what this token can see, no local-cluster list RBAC.
 # Write collections to files so jq never hits ARG_MAX (--argjson puts JSON on argv).
 clusters_file="$(mktemp)"
 projects_file="$(mktemp)"
-trap 'rm -f "${clusters_file}" "${projects_file}"' EXIT
+work_dir=""
+cleanup_export_tmp() {
+  [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return 0
+  rm -f "${clusters_file}" "${projects_file}"
+  if [[ -n "${work_dir}" ]]; then
+    rm -rf "${work_dir}"
+  fi
+}
+trap cleanup_export_tmp EXIT
 rancher_list /v3/clusters >"${clusters_file}"
 rancher_list /v3/projects >"${projects_file}"
 
@@ -180,16 +253,27 @@ export_namespaces_for_cluster() {
   done < <(jq -c '(.items // [])[]' <<<"${ns_json}")
 }
 
-exported_projects=0
-exported_memberships=0
-exported_clusters=0
-exported_namespaces=0
-exported_rolebindings=0
-exported_roles=0
+write_export_counts() {
+  local dest="$1"
+  cat >"${dest}" <<EOF
+clusters=${exported_clusters}
+projects=${exported_projects}
+memberships=${exported_memberships}
+namespaces=${exported_namespaces}
+rolebindings=${exported_rolebindings}
+roles=${exported_roles}
+EOF
+}
 
-while IFS= read -r cluster_id; do
-  [[ -z "${cluster_id}" ]] && continue
-  should_export_cluster "${cluster_id}" || continue
+export_one_cluster() {
+  local cluster_id="$1"
+  local counts_file="${2:-}"
+  local cluster display_name provider folder cluster_dir
+  local cluster_projects project_count cluster_project_ids=()
+  local project project_id project_display backing_ns project_file
+  local prtb_json prtb prtb_name prtb_file
+  local exported_clusters=0 exported_projects=0 exported_memberships=0
+  local exported_namespaces=0 exported_rolebindings=0 exported_roles=0
 
   cluster="$(jq -c --arg id "${cluster_id}" '.items[] | select(.id == $id)' "${clusters_file}")"
   if [[ -z "${cluster}" ]]; then
@@ -198,6 +282,10 @@ while IFS= read -r cluster_id; do
   display_name="$(jq -r '.name // .id // empty' <<<"${cluster}")"
   if [[ -z "${display_name}" ]]; then
     display_name="${cluster_id}"
+  fi
+  if ! should_export_cluster "${cluster_id}" "${display_name}"; then
+    [[ -n "${counts_file}" ]] && write_export_counts "${counts_file}"
+    return 0
   fi
   provider="$(jq -r '.provider // "unknown"' <<<"${cluster}")"
 
@@ -212,7 +300,7 @@ provider: ${provider}
 EOF
 
   echo "cluster ${display_name} (${cluster_id}) -> ${folder}"
-  exported_clusters=$((exported_clusters + 1))
+  exported_clusters=1
 
   # Always query by clusterId. The unfiltered /v3/projects collection can omit
   # downstream projects depending on token scope.
@@ -224,10 +312,10 @@ EOF
   project_count="$(jq '.items | length' <<<"${cluster_projects}")"
   if [[ "${project_count}" -eq 0 ]]; then
     echo "  (no projects)"
-    continue
+    [[ -n "${counts_file}" ]] && write_export_counts "${counts_file}"
+    return 0
   fi
 
-  cluster_project_ids=()
   while IFS= read -r project; do
     project_id="$(jq -r '.id | split(":")[1]' <<<"${project}")"
     project_display="$(jq -r '.name // empty' <<<"${project}")"
@@ -257,7 +345,98 @@ EOF
   if [[ "${INCLUDE_NAMESPACES}" -eq 1 ]]; then
     export_namespaces_for_cluster "${cluster_id}" "${cluster_dir}" ${cluster_project_ids[@]+"${cluster_project_ids[@]}"}
   fi
+
+  [[ -n "${counts_file}" ]] && write_export_counts "${counts_file}"
+}
+
+reap_finished_jobs() {
+  local pid still=()
+  for pid in ${running_pids[@]+"${running_pids[@]}"}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      still+=("${pid}")
+    else
+      if ! wait "${pid}"; then
+        job_failed=1
+      fi
+    fi
+  done
+  running_pids=("${still[@]+"${still[@]}"}")
+}
+
+wait_for_job_slot() {
+  while (( ${#running_pids[@]} >= JOBS )); do
+    sleep 0.2
+    reap_finished_jobs
+  done
+}
+
+count_field() {
+  local file="$1" key="$2" value
+  value="$(sed -n "s/^${key}=//p" "${file}")"
+  printf '%s' "${value:-0}"
+}
+
+add_counts_from_file() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 0
+  exported_clusters=$((exported_clusters + $(count_field "${file}" clusters)))
+  exported_projects=$((exported_projects + $(count_field "${file}" projects)))
+  exported_memberships=$((exported_memberships + $(count_field "${file}" memberships)))
+  exported_namespaces=$((exported_namespaces + $(count_field "${file}" namespaces)))
+  exported_rolebindings=$((exported_rolebindings + $(count_field "${file}" rolebindings)))
+  exported_roles=$((exported_roles + $(count_field "${file}" roles)))
+}
+
+exported_projects=0
+exported_memberships=0
+exported_clusters=0
+exported_namespaces=0
+exported_rolebindings=0
+exported_roles=0
+job_failed=0
+running_pids=()
+work_dir="$(mktemp -d)"
+job_idx=0
+
+while IFS= read -r cluster_id; do
+  [[ -z "${cluster_id}" ]] && continue
+  if [[ "${JOBS}" -eq 1 ]]; then
+    export_one_cluster "${cluster_id}" "${work_dir}/${job_idx}.counts"
+    add_counts_from_file "${work_dir}/${job_idx}.counts"
+  else
+    wait_for_job_slot
+    (
+      export_one_cluster "${cluster_id}" "${work_dir}/${job_idx}.counts"
+    ) >"${work_dir}/${job_idx}.log" 2>&1 &
+    running_pids+=("$!")
+  fi
+  job_idx=$((job_idx + 1))
 done <<<"${cluster_ids}"
+
+if [[ "${JOBS}" -gt 1 ]]; then
+  while (( ${#running_pids[@]} > 0 )); do
+    sleep 0.2
+    reap_finished_jobs
+  done
+  i=0
+  while (( i < job_idx )); do
+    if [[ -f "${work_dir}/${i}.log" ]]; then
+      cat "${work_dir}/${i}.log"
+    fi
+    add_counts_from_file "${work_dir}/${i}.counts"
+    i=$((i + 1))
+  done
+fi
+
+if [[ "${job_failed}" -ne 0 ]]; then
+  echo "error: one or more cluster exports failed" >&2
+  exit 1
+fi
+
+if [[ ${#FILTER_CLUSTERS[@]} -gt 0 && "${exported_clusters}" -eq 0 ]]; then
+  echo "error: no visible clusters matched: ${FILTER_CLUSTERS[*]}" >&2
+  exit 1
+fi
 
 echo
 if [[ "${INCLUDE_NAMESPACES}" -eq 1 ]]; then

@@ -13,7 +13,11 @@ Requires `curl`, `jq`, `yq`, and a Rancher API token.
 | `--no-local-rancher-token TOK` | `test.sh` | Token for the no-local-rancher user (or `NO_LOCAL_RANCHER_TOKEN` in `.env`) |
 | `--no-local-rancher-user-id ID` | `test.sh` | User to grant fixture access (default: `m-n9rl5`) |
 | `--out DIR` | both | Output directory |
-| `--cluster ID` | `export.sh` | Limit export to one cluster ID (repeatable) |
+| `--cluster ID\|NAME` | `export.sh` | Limit export to one cluster ID or friendly name (repeatable) |
+| `--cluster-name NAME` | `export.sh` | Same as `--cluster` (repeatable) |
+| `--cluster-file FILE` | `export.sh` | Cluster IDs or names, one per line (repeatable) |
+| `--jobs N` | `export.sh` | Export up to N clusters at once (default: 1) |
+| `--parallel N` | `export.sh` | Same as `--jobs` |
 | `--include-namespaces` | `export.sh` | Also export project namespaces and their Roles/RoleBindings |
 | `-h`, `--help` | both | Show usage |
 
@@ -25,6 +29,16 @@ Requires `curl`, `jq`, `yq`, and a Rancher API token.
   --rancher-url "$RANCHER_URL" \
   --rancher-token "$NO_LOCAL_RANCHER_TOKEN" \
   --include-namespaces
+
+# Limit to one cluster by friendly name or ID
+./export-projects/export.sh --cluster my-app-cluster
+./export-projects/export.sh --cluster c-m-xxxxx
+
+# Limit to clusters listed in a file (one ID or name per line)
+./export-projects/export.sh --cluster-file clusters.txt
+
+# Export several clusters at once
+./export-projects/export.sh --jobs 8 --include-namespaces
 
 # Admin creates blank custom clusters, grants the no-local-rancher user, exports as that user, then cleans up
 ./export-projects/test.sh \

@@ -322,11 +322,25 @@ grant_no_local_rancher_user() {
 no_local_rancher_sees_cluster_project() {
   local cluster_id="$1"
   local project_name="$2"
-  local code
-  code="$(curl -sS -o /dev/null -w "%{http_code}" ${CURL_INSECURE:+-k} \
+  local wanted="${cluster_id}:${project_name}"
+  local body code
+  body="$(mktemp)"
+  code="$(curl -sS -o "${body}" -w "%{http_code}" ${CURL_INSECURE:+-k} \
     -H "Authorization: Bearer ${NO_LOCAL_RANCHER_TOKEN}" -H "Accept: application/json" \
-    "${RANCHER_URL}/v3/projects/${cluster_id}:${project_name}" || true)"
-  [[ "${code}" == "200" ]]
+    "${RANCHER_URL}/v3/projects/${wanted}" || true)"
+  if [[ "${code}" == "200" ]]; then
+    rm -f "${body}"
+    return 0
+  fi
+  code="$(curl -sS -o "${body}" -w "%{http_code}" ${CURL_INSECURE:+-k} \
+    -H "Authorization: Bearer ${NO_LOCAL_RANCHER_TOKEN}" -H "Accept: application/json" \
+    "${RANCHER_URL}/v3/projects?clusterId=${cluster_id}" || true)"
+  if [[ "${code}" == "200" ]] && jq -e --arg id "${wanted}" '.data[]? | select(.id == $id)' "${body}" >/dev/null 2>&1; then
+    rm -f "${body}"
+    return 0
+  fi
+  rm -f "${body}"
+  return 1
 }
 
 # Leftover from an earlier local-cluster fixture. Prod users never see local.
@@ -442,7 +456,7 @@ if [[ "${SKIP_CUSTOM_CLUSTERS}" != "1" ]]; then
   sleep 2
   i=0
   for mgmt_id in "${MGMT_IDS[@]}"; do
-    wait_for "no-local-rancher project access on ${mgmt_id}:${PROJECT_NAMES[$i]}" 120 no_local_rancher_sees_cluster_project "${mgmt_id}" "${PROJECT_NAMES[$i]}"
+    wait_for "no-local-rancher project access on ${mgmt_id}:${PROJECT_NAMES[$i]}" 180 no_local_rancher_sees_cluster_project "${mgmt_id}" "${PROJECT_NAMES[$i]}"
     i=$((i + 1))
   done
 fi
